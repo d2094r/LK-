@@ -9,3 +9,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY lk_bot.py .
 
 CMD ["python", "-u", "lk_bot.py"]
+
+COPY lk_words.json .
