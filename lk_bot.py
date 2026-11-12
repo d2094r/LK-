@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -16,6 +17,16 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from learner import normalize, suggest
+
+# VCの受信拡張は試験的。導入できなくてもテキストBotは動作を維持する。
+try:
+    from discord.ext import voice_recv
+except (ImportError, RuntimeError, AttributeError) as exc:
+    voice_recv = None
+    _voice_receive_import_error = str(exc)
+else:
+    _voice_receive_import_error = ""
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lk_bot")
@@ -317,6 +328,168 @@ async def before_periodic_learning():
     await bot.wait_until_ready()
 
 
+# --- VCマイク活動の試験的検出機能（発言内容の文字起こしではない）---
+# 通知対象は各自 /lk_vc_start で明示的に参加したユーザーのみ。
+# 生音声・録音ファイル・書き起こし内容は保存しない。
+vc_opted_in: dict[int, set[int]] = {}
+
+
+def _caller_voice_channel(interaction: discord.Interaction):
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+        return None
+    return member.voice.channel if isinstance(member.voice.channel, discord.VoiceChannel) else None
+
+
+async def _join_voice(channel: discord.VoiceChannel):
+    guild = channel.guild
+    vc = guild.voice_client
+    if vc is not None and vc.is_connected():
+        if vc.channel != channel:
+            raise ValueError("Botは既に別のVCに参加しています。勝手に移動させることはできません。")
+        return vc
+    # 既存のvoice clientが残っている場合は、再接続時に競合しないよう切断。
+    if vc is not None:
+        await vc.disconnect(force=True)
+    me = guild.me
+    if me is not None and not channel.permissions_for(me).connect:
+        raise PermissionError("BotにこのVCへ接続する権限がありません。")
+    client_cls = voice_recv.VoiceRecvClient if voice_recv is not None else discord.VoiceClient
+    return await channel.connect(cls=client_cls, timeout=25, reconnect=True, self_deaf=False)
+
+
+if voice_recv is not None:
+    class MicActivitySink(voice_recv.AudioSink):
+        """声が出たというイベントだけを扱う。音声本文は保持しない。"""
+        def __init__(self, guild_id: int, notify_channel, event_loop):
+            super().__init__()
+            self.guild_id = guild_id
+            self.notify_channel = notify_channel
+            self.event_loop = event_loop
+            self.last_message: dict[int, float] = {}
+
+        def wants_opus(self) -> bool:
+            return True
+
+        def write(self, user, data):
+            # 声の内容（PCMやOpus）は処理・保存しない。
+            pass
+
+        def cleanup(self):
+            self.last_message.clear()
+
+        @voice_recv.AudioSink.listener()
+        def on_voice_member_speaking_start(self, member: discord.Member):
+            if member.bot or member.id not in vc_opted_in.get(self.guild_id, set()):
+                return
+            now = time.monotonic()
+            if now - self.last_message.get(member.id, 0) < 20:
+                return
+            self.last_message[member.id] = now
+            coro = self.notify_channel.send(
+                f"🎙️ {discord.utils.escape_markdown(member.display_name)} さんのマイク反応を検出しました。"
+                "（語録の音声認識は未対応）",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            future = asyncio.run_coroutine_threadsafe(coro, self.event_loop)
+            def _log_error(fut):
+                try:
+                    fut.result()
+                except Exception:
+                    logger.exception("VCマイク活動の通知に失敗しました")
+            future.add_done_callback(_log_error)
+
+
+@bot.tree.command(name="lk_vc_join", description="自分が参加中のVCへLK Botを呼びます（全員利用可）")
+@app_commands.guild_only()
+async def lk_vc_join(interaction: discord.Interaction):
+    channel = _caller_voice_channel(interaction)
+    if channel is None:
+        await interaction.response.send_message("先に通常のボイスチャンネルへ参加してください。", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        vc = await _join_voice(channel)
+        await interaction.followup.send(
+            f"VC「{discord.utils.escape_markdown(channel.name)}」に参加しました。"
+            "VCマイク活動の検出は /lk_vc_start で個別に開始できます。",
+            ephemeral=True,
+        )
+    except (ValueError, PermissionError, discord.ClientException, discord.HTTPException, asyncio.TimeoutError) as exc:
+        logger.warning("VC参加失敗: guild=%s error=%r", interaction.guild_id, exc)
+        await interaction.followup.send(f"VCへの参加に失敗しました：{str(exc)[:300]}", ephemeral=True)
+
+
+@bot.tree.command(name="lk_vc_start", description="自分のマイク活動検出を開始します（全員利用可・試験機能）")
+@app_commands.guild_only()
+async def lk_vc_start(interaction: discord.Interaction):
+    channel = _caller_voice_channel(interaction)
+    if channel is None:
+        await interaction.response.send_message("検出するには先に通常のVCに参加してください。", ephemeral=True)
+        return
+    if voice_recv is None:
+        await interaction.response.send_message(
+            "音声受信用ライブラリが未導入、または読み込めません。"
+            " 現在は /lk_vc_join によるVC参加のみ利用できます。"
+            f"（詳細: {_voice_receive_import_error[:180]}）", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        vc = await _join_voice(channel)
+        if not isinstance(vc, voice_recv.VoiceRecvClient):
+            await interaction.followup.send(
+                "Botが通常のVC接続として参加しています。一度 /lk_vc_leave で退出させ、"
+                "音声受信ライブラリを導入した状態で再接続してください。", ephemeral=True)
+            return
+        opted = vc_opted_in.setdefault(interaction.guild_id, set())
+        opted.add(interaction.user.id)
+        if not vc.is_listening():
+            sink = MicActivitySink(interaction.guild_id, interaction.channel, asyncio.get_running_loop())
+            vc.listen(sink)
+        await interaction.followup.send(
+            "マイク活動の検出に参加しました。あなたのマイクが反応すると、このテキストチャンネルへ通知します。"
+            "音声本文の保存・文字起こし・LK語句の認識は行いません。"
+            "停止は /lk_vc_stop です。音声の受信はDiscordの暗号化仕様により動かない場合があります。",
+            ephemeral=False,
+        )
+    except (ValueError, PermissionError, discord.ClientException, discord.HTTPException,
+            asyncio.TimeoutError, RuntimeError, OSError) as exc:
+        logger.exception("マイク活動検出の開始に失敗")
+        await interaction.followup.send(
+            "マイク活動検出を開始できませんでした。DAVE対応状況やVC接続権限、Northflankログを確認してください。"
+            f"\n詳細: {str(exc)[:300]}", ephemeral=True)
+
+
+@bot.tree.command(name="lk_vc_stop", description="自分のマイク活動検出を停止します（全員利用可）")
+@app_commands.guild_only()
+async def lk_vc_stop(interaction: discord.Interaction):
+    opted = vc_opted_in.get(interaction.guild_id, set())
+    opted.discard(interaction.user.id)
+    vc = interaction.guild.voice_client
+    if not opted and vc is not None and hasattr(vc, "is_listening") and vc.is_listening():
+        vc.stop_listening()
+    await interaction.response.send_message("あなたのマイク活動検出を停止しました。", ephemeral=True)
+
+
+@bot.tree.command(name="lk_vc_leave", description="同じVCにいるLK Botを退出させます（全員利用可）")
+@app_commands.guild_only()
+async def lk_vc_leave(interaction: discord.Interaction):
+    channel = _caller_voice_channel(interaction)
+    vc = interaction.guild.voice_client
+    if vc is None or not vc.is_connected():
+        await interaction.response.send_message("BotはVCに参加していません。", ephemeral=True)
+        return
+    if channel != vc.channel:
+        await interaction.response.send_message("Botと同じVCにいる人だけが退出させられます。", ephemeral=True)
+        return
+    if hasattr(vc, "is_listening") and vc.is_listening():
+        vc.stop_listening()
+    vc_opted_in.pop(interaction.guild_id, None)
+    await vc.disconnect(force=True)
+    await interaction.response.send_message("VCから退出し、マイク活動検出を停止しました。", ephemeral=True)
+
+
 @bot.tree.command(name="lk", description="登録されたLK語録をランダムに1つ発言します")
 @app_commands.guild_only()
 async def lk(interaction: discord.Interaction):
@@ -421,10 +594,9 @@ async def lk_target(interaction: discord.Interaction, user: discord.User):
         )
 
 
-@bot.tree.command(name="lk_scan", description="現在の対象ユーザーの履歴を再分析して語録を自動追加します")
+@bot.tree.command(name="lk_scan", description="対象ユーザーの履歴を再分析して語録を自動追加します（全員利用可）")
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.cooldown(1, 600.0, key=lambda interaction: interaction.guild_id)
 async def lk_scan(interaction: discord.Interaction):
     cfg = get_settings(interaction.guild_id)
     if not cfg.get("target_user_id"):
@@ -472,6 +644,8 @@ async def lk_status(interaction: discord.Interaction):
 async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         msg = "この操作には「サーバーの管理」権限が必要です。"
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"このサーバーでは連続分析を制限しています。あと{error.retry_after:.0f}秒後に実行できます。"
     else:
         logger.error("スラッシュコマンドエラー: %r", error)
         msg = "処理中にエラーが発生しました。Northflankのログを確認してください。"
